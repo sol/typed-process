@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -135,8 +136,9 @@ import qualified System.Process as P
 import System.IO (hClose)
 import System.IO.Error (isPermissionError)
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (asyncWithUnmask, cancel, waitCatch)
-import Control.Concurrent.STM (newEmptyTMVarIO, atomically, putTMVar, TMVar, readTMVar, tryReadTMVar, STM, tryPutTMVar, throwSTM, catchSTM)
+import Control.Concurrent.Async (asyncWithUnmask)
+import qualified Control.Concurrent.Async as Async
+import Control.Concurrent.STM (newEmptyTMVarIO, atomically, putTMVar, TMVar, readTMVar, tryReadTMVar, STM, throwSTM, catchSTM)
 import System.Exit (ExitCode (ExitSuccess, ExitFailure))
 import System.Process.Typed.Internal
 import qualified Data.ByteString.Lazy as L
@@ -239,23 +241,12 @@ startProcess pConfig'@ProcessConfig {..} = liftIO $ do
               atomically $ putTMVar pExitCode ec
               return ec
 
+          let waitForProcess = Async.wait waitingThread :: IO ExitCode
+
           let pCleanup = pCleanup1 `finally` do
-                  -- First: stop calling waitForProcess, so that we can
-                  -- avoid race conditions where the process is removed from
-                  -- the system process table while we're trying to
-                  -- terminate it.
-                  cancel waitingThread
-
-                  -- Now check if the process had already exited
-                  eec <- waitCatch waitingThread
-
-                  case eec of
-                      -- Process already exited, nothing to do
-                      Right _ec -> return ()
-
-                      -- Process didn't exit yet, let's terminate it and
-                      -- then call waitForProcess ourselves
-                      Left _ -> do
+                  _ :: ExitCode <- Async.poll waitingThread >>= \ case
+                      Just r -> either throwIO return r
+                      Nothing -> do
                           eres <- try $ P.terminateProcess pHandle
                           ec <-
                             case eres of
@@ -272,11 +263,11 @@ startProcess pConfig'@ProcessConfig {..} = liftIO $ do
                                 -- Recommendation: always use the multi-threaded
                                 -- runtime!
                                 | isPermissionError e && not multiThreadedRuntime && isWindows ->
-                                  P.waitForProcess pHandle
+                                  waitForProcess
                                 | otherwise -> throwIO e
-                              Right () -> P.waitForProcess pHandle
-                          success <- atomically $ tryPutTMVar pExitCode ec
-                          evaluate $ assert success ()
+                              Right () -> waitForProcess
+                          return ec
+                  return ()
 
           return Process {..}
   where
